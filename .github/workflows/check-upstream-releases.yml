@@ -21,11 +21,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
-      # Bounds for the reusable build workflow: a called job may only request
-      # permissions the calling job allows, so this must cover the build job.
       contents: read
-      packages: write
-      actions: write
+      # The GITHUB_TOKEN is used to read manifests from GHCR.
+      packages: read
     outputs:
       build_refs: ${{ steps.plan.outputs.refs }}
       base_path: ${{ steps.plan.outputs.base_path }}
@@ -128,6 +126,12 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build_refs != '[]'
+    # This job calls the reusable build workflow, so it must allow the
+    # permissions the called job requests.
+    permissions:
+      contents: read
+      packages: write
+      actions: write
     strategy:
       fail-fast: false
       matrix:
