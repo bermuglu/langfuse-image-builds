@@ -1,0 +1,134 @@
+name: Check upstream releases
+
+# Finds the newest v3.* and v4.* release tags of langfuse/langfuse and builds
+# any that are missing from GHCR or built with a different base path.
+#
+# The registry is the source of state; this repo never accumulates build
+# history.
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/bermuglu/langfuse-web
+  UPSTREAM_REPO: langfuse/langfuse
+  BASE_PATH: ${{ vars.NEXT_PUBLIC_BASE_PATH || secrets.NEXT_PUBLIC_BASE_PATH }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build_refs: ${{ steps.plan.outputs.refs }}
+
+    steps:
+      - name: Validate base path
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_PATH}" ]; then
+            echo "NEXT_PUBLIC_BASE_PATH is empty. Set it as a repository variable:" >&2
+            echo "Settings > Secrets and variables > Variables > New repository variable." >&2
+            exit 1
+          fi
+          case "${BASE_PATH}" in
+            /*) ;;
+            *) echo "NEXT_PUBLIC_BASE_PATH must start with '/', got '${BASE_PATH}'." >&2; exit 1 ;;
+          esac
+          case "${BASE_PATH}" in
+            */) echo "NEXT_PUBLIC_BASE_PATH must not end with '/', got '${BASE_PATH}'." >&2; exit 1 ;;
+          esac
+          echo "Expecting images built with NEXT_PUBLIC_BASE_PATH=${BASE_PATH}"
+
+      - name: Find newest v3 and v4 release tags upstream
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest_v3=""
+          latest_v4=""
+          # The tags API lists semver tags newest first, so the first match of
+          # each major line is that line's latest release.
+          for page in $(seq 1 8); do
+            names="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100&page=${page}" --jq '.[].name')"
+            if [ -z "${names}" ]; then
+              break
+            fi
+            if [ -z "${latest_v3}" ]; then
+              latest_v3="$(grep -E '^v3\.[0-9]+\.[0-9]+$' <<<"${names}" | head -n 1)"
+            fi
+            if [ -z "${latest_v4}" ]; then
+              latest_v4="$(grep -E '^v4\.[0-9]+\.[0-9]+$' <<<"${names}" | head -n 1)"
+            fi
+            if [ -n "${latest_v3}" ] && [ -n "${latest_v4}" ]; then
+              break
+            fi
+          done
+          if [ -z "${latest_v3}" ] || [ -z "${latest_v4}" ]; then
+            echo "No v3/v4 release tag found upstream (v3='${latest_v3}', v4='${latest_v4}')." >&2
+            exit 1
+          fi
+          echo "Newest upstream release tags: v3=${latest_v3} v4=${latest_v4}"
+          {
+            echo "latest_v3=${latest_v3}"
+            echo "latest_v4=${latest_v4}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compare tips against the registry
+        id: plan
+        run: |
+          set -uo pipefail
+          repo_path="${IMAGE_NAME#*://}"
+          accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
+          refs=()
+          for tag in "${{ steps.latest.outputs.latest_v3 }}" "${{ steps.latest.outputs.latest_v4 }}"; do
+            body=""
+            if [ -n "${token}" ]; then
+              body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+                "https://${REGISTRY}/v2/${repo_path}/manifests/${tag}")" || body=""
+            fi
+            if [ -z "${body}" ]; then
+              echo "${tag}: not in registry -> queue build"
+              refs+=("${tag}")
+              continue
+            fi
+            if jq -e '.manifests' <<<"${body}" > /dev/null; then
+              digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
+              body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
+                -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+                "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")"
+            fi
+            label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
+            if [ "${label}" = "${BASE_PATH}" ]; then
+              echo "${tag}: up to date (base path '${BASE_PATH}')"
+            else
+              echo "${tag}: built with base path '${label:-<none>}', current is '${BASE_PATH}' -> queue rebuild"
+              refs+=("${tag}")
+            fi
+          done
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "Nothing to build."
+            echo "refs=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "refs=$(printf '%s\n' "${refs[@]}" | jq -R . | jq -s -c .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build_refs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(needs.check.outputs.build_refs) }}
+    uses: ./.github/workflows/build-web-image.yml
+    with:
+      ref: ${{ matrix.ref }}
+      base_path: ${{ env.BASE_PATH }}
+    secrets: inherit
