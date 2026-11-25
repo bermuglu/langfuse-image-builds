@@ -95,12 +95,14 @@ jobs:
 
       - name: Skip if the image is already up to date
         id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           tag="${{ steps.resolve.outputs.image_tag }}"
           repo_path="${IMAGE_NAME#*://}"
           accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
-          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
           body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
             "https://${REGISTRY}/v2/${repo_path}/manifests/${tag}")" || {
