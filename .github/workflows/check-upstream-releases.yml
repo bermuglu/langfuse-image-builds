@@ -21,8 +21,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
+      # Bounds for the reusable build workflow: a called job may only request
+      # permissions the calling job allows, so this must cover the build job.
       contents: read
-      packages: read
+      packages: write
+      actions: write
     outputs:
       build_refs: ${{ steps.plan.outputs.refs }}
       base_path: ${{ steps.plan.outputs.base_path }}
