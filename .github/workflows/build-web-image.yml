@@ -51,8 +51,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      # The actions scope is required by the BuildKit `type=gha` cache.
-      actions: read
+      # The actions scope is required by the BuildKit `type=gha` cache;
+      # write also covers cache reads.
       actions: write
 
     steps:
