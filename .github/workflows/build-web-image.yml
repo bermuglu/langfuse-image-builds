@@ -124,8 +124,18 @@ jobs:
             echo "Tag ${tag} not present in the registry -> build."
             exit 0
           }
+          # buildx pushes an OCI index (image + provenance attestation), and
+          # Docker --label lands in the image config, not the manifest.
           if jq -e '.manifests' <<<"${body}" > /dev/null; then
-            digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
+            # Prefer the linux/amd64 image entry, then any non-attestation entry.
+            digest="$(jq -r '
+              [.manifests[] | select((.annotations // {})["vnd.docker.reference.type"] == null)] as $img
+              | (($img | map(select(.platform.os == "linux" and .platform.architecture == "amd64"))) + $img)
+              | .[0].digest // empty' <<<"${body}")"
+            if [ -z "${digest}" ]; then
+              echo "No image entry in the index for ${tag} -> build."
+              exit 0
+            fi
             body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
               -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
               "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")" || {
@@ -133,7 +143,17 @@ jobs:
               exit 0
             }
           fi
-          label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
+          config_digest="$(jq -r '.config.digest // empty' <<<"${body}")"
+          if [ -z "${config_digest}" ]; then
+            echo "No image config for ${tag} -> build."
+            exit 0
+          fi
+          config="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
+            "https://${REGISTRY}/v2/${repo_path}/blobs/${config_digest}")" || {
+            echo "Could not read the image config for ${tag} -> build."
+            exit 0
+          }
+          label="$(jq -r '.config.Labels["langfuse.base-path"] // empty' <<<"${config}")"
           if [ "${label}" = "${BASE_PATH}" ]; then
             echo "Tag ${tag} already built with base path '${BASE_PATH}' -> skip."
             echo "skip=true" >> "$GITHUB_OUTPUT"
