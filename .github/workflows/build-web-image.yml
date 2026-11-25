@@ -47,6 +47,8 @@ concurrency:
 
 jobs:
   build:
+    # Push-triggered smoke runs of this file carry no ref; skip them.
+    if: ${{ inputs.ref != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
