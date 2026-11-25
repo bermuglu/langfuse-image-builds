@@ -25,6 +25,7 @@ jobs:
       packages: read
     outputs:
       build_refs: ${{ steps.plan.outputs.refs }}
+      base_path: ${{ steps.plan.outputs.base_path }}
 
     steps:
       - name: Validate base path
@@ -119,6 +120,7 @@ jobs:
           else
             echo "refs=$(printf '%s\n' "${refs[@]}" | jq -R . | jq -s -c .)" >> "$GITHUB_OUTPUT"
           fi
+          echo "base_path=${BASE_PATH}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -130,5 +132,5 @@ jobs:
     uses: ./.github/workflows/build-web-image.yml
     with:
       ref: ${{ matrix.ref }}
-      base_path: ${{ env.BASE_PATH }}
+      base_path: ${{ needs.check.outputs.base_path }}
     secrets: inherit
