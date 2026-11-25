@@ -102,8 +102,14 @@ jobs:
           tag="${{ steps.resolve.outputs.image_tag }}"
           repo_path="${IMAGE_NAME#*://}"
           accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
-          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
+          # The token endpoint 403s while the package does not exist yet
+          # (first run). Fail-open: any registry hiccup means "just build".
+          token=""
+          if ! token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"; then
+            echo "Registry token request failed (package may not exist yet) -> build."
+            exit 0
+          fi
           body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
             "https://${REGISTRY}/v2/${repo_path}/manifests/${tag}")" || {
             echo "Tag ${tag} not present in the registry -> build."
@@ -113,7 +119,10 @@ jobs:
             digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
             body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
               -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-              "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")"
+              "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")" || {
+              echo "Could not read the manifest for ${tag} -> build."
+              exit 0
+            }
           fi
           label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
           if [ "${label}" = "${BASE_PATH}" ]; then
