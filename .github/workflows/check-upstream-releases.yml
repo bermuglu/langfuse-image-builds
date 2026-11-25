@@ -84,11 +84,13 @@ jobs:
 
       - name: Compare tips against the registry
         id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           repo_path="${IMAGE_NAME#*://}"
           accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
-          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
           refs=()
           for tag in "${{ steps.latest.outputs.latest_v3 }}" "${{ steps.latest.outputs.latest_v4 }}"; do
