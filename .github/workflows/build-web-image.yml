@@ -1,0 +1,161 @@
+name: Build web image
+
+# Builds the Langfuse web image from upstream source with the base path
+# inlined at build time, and pushes it to GHCR.
+#
+# Trigger:
+#   - manually, with any upstream tag (v3.x.y / v4.x.y) or full commit SHA
+#   - from "Check upstream releases" for the newest v3/v4 tags
+#
+# The registry is the source of state: an image is (re)built only when its tag
+# is missing or its `langfuse.base-path` label does not match the current
+# NEXT_PUBLIC_BASE_PATH variable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag (e.g. v4.86.0) or full commit SHA to build"
+        required: true
+        type: string
+      base_path:
+        description: "Override NEXT_PUBLIC_BASE_PATH for this run only"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: "Upstream tag or full commit SHA to build"
+        required: true
+        type: string
+      base_path:
+        description: "Base path to inline, passed through by the check workflow"
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/bermuglu/langfuse-web
+  UPSTREAM_REPO: langfuse/langfuse
+  BASE_PATH: ${{ inputs.base_path || vars.NEXT_PUBLIC_BASE_PATH || secrets.NEXT_PUBLIC_BASE_PATH }}
+
+concurrency:
+  # Never build the same upstream ref twice at once; a duplicate run waits and
+  # is then skipped by the registry guard below.
+  group: langfuse-web-build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # The actions scope is required by the BuildKit `type=gha` cache.
+      actions: read
+      actions: write
+
+    steps:
+      - name: Validate base path
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_PATH}" ]; then
+            echo "NEXT_PUBLIC_BASE_PATH is empty. Set it as a repository variable:" >&2
+            echo "Settings > Secrets and variables > Variables > New repository variable." >&2
+            exit 1
+          fi
+          case "${BASE_PATH}" in
+            /*) ;;
+            *) echo "NEXT_PUBLIC_BASE_PATH must start with '/', got '${BASE_PATH}'." >&2; exit 1 ;;
+          esac
+          case "${BASE_PATH}" in
+            */) echo "NEXT_PUBLIC_BASE_PATH must not end with '/', got '${BASE_PATH}'." >&2; exit 1 ;;
+          esac
+          echo "Will inline NEXT_PUBLIC_BASE_PATH=${BASE_PATH}"
+
+      - name: Resolve upstream ref to commit SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref }}"
+          if [[ "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+            gh api "repos/${UPSTREAM_REPO}/commits/${ref}" --jq '.sha' > /dev/null
+            echo "sha=${ref}" >> "$GITHUB_OUTPUT"
+            echo "image_tag=sha-${ref:0:12}" >> "$GITHUB_OUTPUT"
+          else
+            sha="$(gh api "repos/${UPSTREAM_REPO}/tags/${ref}" --jq '.commit.sha')"
+            echo "Upstream tag ${ref} -> ${sha}"
+            echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${ref}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if the image is already up to date
+        id: guard
+        run: |
+          set -uo pipefail
+          tag="${{ steps.resolve.outputs.image_tag }}"
+          repo_path="${IMAGE_NAME#*://}"
+          accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+          token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
+          body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+            "https://${REGISTRY}/v2/${repo_path}/manifests/${tag}")" || {
+            echo "Tag ${tag} not present in the registry -> build."
+            exit 0
+          }
+          if jq -e '.manifests' <<<"${body}" > /dev/null; then
+            digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
+            body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+              "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")"
+          fi
+          label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
+          if [ "${label}" = "${BASE_PATH}" ]; then
+            echo "Tag ${tag} already built with base path '${BASE_PATH}' -> skip."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${tag} built with base path '${label:-<none>}', current is '${BASE_PATH}' -> build."
+          fi
+
+      - name: Checkout upstream source
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: langfuse/langfuse
+          ref: ${{ steps.resolve.outputs.sha }}
+          path: langfuse-src
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        if: steps.guard.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.guard.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.guard.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./langfuse-src
+          # Stock upstream Dockerfile, unmodified.
+          file: ./langfuse-src/web/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            NEXT_PUBLIC_BASE_PATH=${{ env.BASE_PATH }}
+            NEXT_PUBLIC_BUILD_ID=${{ steps.resolve.outputs.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.resolve.outputs.image_tag }}
+          labels: |
+            langfuse.base-path=${{ env.BASE_PATH }}
+            org.opencontainers.image.revision=${{ steps.resolve.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
