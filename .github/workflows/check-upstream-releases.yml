@@ -94,34 +94,41 @@ jobs:
           # an empty token then simply means "nothing to compare".
           token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty' || true)"
-          refs=()
-          for tag in "${{ steps.latest.outputs.latest_v3 }}" "${{ steps.latest.outputs.latest_v4 }}"; do
-            body=""
-            if [ -n "${token}" ]; then
-              body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
-                "https://${REGISTRY}/v2/${repo_path}/manifests/${tag}")" || body=""
-            fi
-            if [ -z "${body}" ]; then
-              echo "${tag}: not in registry -> queue build"
-              refs+=("${tag}")
-              continue
-            fi
+          # Prints the langfuse.base-path label for a tag; empty when the tag
+          # is absent or unreadable. buildx pushes an OCI index (image +
+          # provenance attestation), and Docker --label lands in the image
+          # config, not the manifest.
+          read_base_path() {
+            local body digest config
+            body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+              "https://${REGISTRY}/v2/${repo_path}/manifests/$1" 2> /dev/null)" || return 0
             if jq -e '.manifests' <<<"${body}" > /dev/null; then
-              digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
+              # Prefer the linux/amd64 image entry, then any non-attestation entry.
+              digest="$(jq -r '
+                [.manifests[] | select((.annotations // {})["vnd.docker.reference.type"] == null)] as $img
+                | (($img | map(select(.platform.os == "linux" and .platform.architecture == "amd64"))) + $img)
+                | .[0].digest // empty' <<<"${body}")"
+              [ -n "${digest}" ] || return 0
               body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
                 -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-                "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")" || body=""
+                "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}" 2> /dev/null)" || return 0
             fi
-            if [ -z "${body}" ]; then
-              echo "${tag}: manifest unreadable -> queue build"
-              refs+=("${tag}")
-              continue
+            digest="$(jq -r '.config.digest // empty' <<<"${body}")"
+            [ -n "${digest}" ] || return 0
+            config="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
+              "https://${REGISTRY}/v2/${repo_path}/blobs/${digest}" 2> /dev/null)" || return 0
+            jq -r '.config.Labels["langfuse.base-path"] // empty' <<<"${config}"
+          }
+          refs=()
+          for tag in "${{ steps.latest.outputs.latest_v3 }}" "${{ steps.latest.outputs.latest_v4 }}"; do
+            label=""
+            if [ -n "${token}" ]; then
+              label="$(read_base_path "${tag}")"
             fi
-            label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
             if [ "${label}" = "${BASE_PATH}" ]; then
               echo "${tag}: up to date (base path '${BASE_PATH}')"
             else
-              echo "${tag}: built with base path '${label:-<none>}', current is '${BASE_PATH}' -> queue rebuild"
+              echo "${tag}: built with base path '${label:-<none>}', current is '${BASE_PATH}' -> queue build"
               refs+=("${tag}")
             fi
           done
