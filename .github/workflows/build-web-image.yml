@@ -83,13 +83,22 @@ jobs:
           set -euo pipefail
           ref="${{ inputs.ref }}"
           if [[ "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+            # Verify the commit exists upstream before building it.
             gh api "repos/${UPSTREAM_REPO}/commits/${ref}" --jq '.sha' > /dev/null
             echo "sha=${ref}" >> "$GITHUB_OUTPUT"
             echo "image_tag=sha-${ref:0:12}" >> "$GITHUB_OUTPUT"
           else
-            sha="$(gh api "repos/${UPSTREAM_REPO}/tags/${ref}" --jq '.commit.sha')"
-            echo "Upstream tag ${ref} -> ${sha}"
-            echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+            # git/refs/tags/{ref} works for plain and annotated tags alike;
+            # the /tags/{ref} endpoint 404s on this upstream's tags.
+            tag_ref="$(gh api "repos/${UPSTREAM_REPO}/git/refs/tags/${ref}")"
+            obj_sha="$(jq -r '.object.sha' <<<"${tag_ref}")"
+            if [ "$(jq -r '.object.type' <<<"${tag_ref}")" = "tag" ]; then
+              # Annotated tag: dereference to the commit it points at.
+              tag_obj="$(gh api "repos/${UPSTREAM_REPO}/git/tags/${obj_sha}")"
+              obj_sha="$(jq -r '.object.sha' <<<"${tag_obj}")"
+            fi
+            echo "Upstream tag ${ref} -> ${obj_sha}"
+            echo "sha=${obj_sha}" >> "$GITHUB_OUTPUT"
             echo "image_tag=${ref}" >> "$GITHUB_OUTPUT"
           fi
 
