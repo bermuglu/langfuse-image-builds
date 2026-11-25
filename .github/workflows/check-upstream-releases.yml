@@ -90,8 +90,10 @@ jobs:
           set -uo pipefail
           repo_path="${IMAGE_NAME#*://}"
           accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+          # The token endpoint 403s until the first build creates the package;
+          # an empty token then simply means "nothing to compare".
           token="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty')"
+            "https://${REGISTRY}/token?scope=repository:${repo_path}:pull" | jq -r '.token // empty' || true)"
           refs=()
           for tag in "${{ steps.latest.outputs.latest_v3 }}" "${{ steps.latest.outputs.latest_v4 }}"; do
             body=""
@@ -108,7 +110,12 @@ jobs:
               digest="$(jq -r '.manifests[0].digest' <<<"${body}")"
               body="$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${token}" \
                 -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-                "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")"
+                "https://${REGISTRY}/v2/${repo_path}/manifests/${digest}")" || body=""
+            fi
+            if [ -z "${body}" ]; then
+              echo "${tag}: manifest unreadable -> queue build"
+              refs+=("${tag}")
+              continue
             fi
             label="$(jq -r '.labels["langfuse.base-path"] // empty' <<<"${body}")"
             if [ "${label}" = "${BASE_PATH}" ]; then
